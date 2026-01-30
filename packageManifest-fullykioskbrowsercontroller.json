@@ -1,16 +1,16 @@
 {
   "packageName": "Fully Kiosk Browser Controller",
-  "author": "Gavin Campbell",
-  "version": "1.41",
+  "author": "Eduardo Simioni/Gavin Campbell",
+  "version": "1.5.0",
   "minimumHEVersion": "2.1.0",
-  "dateReleased": "2021-02-03",
+  "dateReleased": "2026-01-29",
   "apps": [],
   "drivers": [
 	{
       "id": "9bd2dd4b-ba93-44b3-b673-e6892c71247c",
       "name": "Fully Kiosk Browser Controller",
-      "namespace": "GvnCampbell",
-      "location": "https://raw.githubusercontent.com/GvnCampbell/Hubitat/master/Drivers/FullyKioskBrowserController.groovy",
+      "namespace": "esimioni",
+      "location": "https://raw.githubusercontent.com/esimioni/fullykioskbrowser-hubitat-driver/master/Drivers/FullyKioskBrowserController.groovy",
       "required": true
     }
   ]
