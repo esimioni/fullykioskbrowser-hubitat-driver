@@ -1,4 +1,4 @@
-// Fully Kiosk Browser Driver 1.50
+// Fully Kiosk Browser Driver 1.60
 // Github: https://github.com/esimioni/fullykioskbrowser-hubitat-driver
 
 // Fork of Original Driver by Gavin Campbell 1.41:
@@ -6,6 +6,17 @@
 // Original Support: https://community.hubitat.com/t/release-fully-kiosk-browser-controller/12223
 /*
 [Change Log]
+    1.60: Added a language preference option for TTS.
+        : Added support to display overlay messages.
+        : Added support to display "toast" notifications.
+        : Added command to reboot the device. FKB needs to be provisioned as device owner: https://www.fully-kiosk.com/en/#provisioning
+        : Better handling of device inclusion, showing clear warnings instead of misleading errors.
+        : Clear warnings when trying to send commands without server details defined.
+        : Commands 'on, off, screenOn, screenOff' now update the 'switch' attribute accordingly.
+        : Warning shown if sirenFile is not defined when siren is triggered.
+        : Auto clearing of alarm state after siren is triggered (configurable interval).
+        : Breaking: Command 'off' no longer stops the siren, use 'sirenStop'.
+        : Code improvements.
     1.50: Configurable polling interval.
         : States to be updated on Hubitat are now configurable.
         : JS Code injection updated to reduce CPU usage on the tablet and send only configured events.
@@ -87,9 +98,14 @@ metadata {
         command 'loadURL', ['String']
         command 'playSound', ['String']
         command 'restartApp'
+        command 'rebootDevice'
         command 'screenOn'
         command 'screenOff'
         command 'setScreenBrightness', ['Number']
+        command 'setOverlayMessage', [[name:'Message*', type:'STRING', description:'The message to display.'], [name:'Duration', type:'NUMBER', description:'Seconds to display the message (0 for permanent).']]
+        command 'clearOverlayMessage'
+        command 'showToast', ['String']
+        command 'sirenStop'
         command 'startScreensaver'
         command 'stopScreensaver'
         command 'stopSound'
@@ -114,8 +130,10 @@ metadata {
               options:['1':'System', '2':'Ring', '3':'Music', '4':'Alarm', '5':'Notification', '6':'Bluetooth', '7':'System Enforced', '8':'DTMF', '9':'TTS', '10':'Accessibility'],
               defaultValue:'1',required:true,multiple:false)
         input(name:'ttsEngine', type:'enum', title:'TTS Engine', description:'Select the TTS engine that is used.', options:[0:'Hubitat', 1:'Fully Kiosk Browser'], defaultValue:1, required:true)
+        input(name:'ttsLanguage', type:'String', title:'TTS Language', description:'Defines the <a href="https://docs.oracle.com/cd/E13214_01/wli/docs92/xref/xqisocodes.html" target="_blank">language</a> for TTS (ex: en_AU, pt_BR, fr_MU).', defaultValue:'', required:false)
         input(name:'motionTimeout', type:'number', title:'Motion/Acceleration Timeout', description:'Number of seconds before motion/acceleration is reset to inactive.', defaultValue:30, required:true)
         input(name:'pollInterval', type:'number', title:'Polling Interval', description:'Minutes - Enable this option to force polling of the device states. 0 disables it.', range:[0..1440], defaultValue:5, required:true)
+        input(name:'clearAlarmInterval', type:'number', title:'Clear Alarm State Interval', description:'Seconds - Enable this option to automatically clear the alarm state and stop the siren after triggering the siren. 0 disables it.', range:[0..86400], defaultValue:60, required:true)
         input(name:'reportMotion', type: 'bool', title: 'Report Motion (Sensors)', defaultValue: false)
         input(name:'reportCameraMotion', type: 'bool', title: 'Report Camera Motion', defaultValue: false)
         input(name:'reportAcceleration', type: 'bool', title: 'Report Acceleration', defaultValue: false)
@@ -132,12 +150,14 @@ metadata {
 // *** [ Initialization Methods ] *********************************************
 def installed() {
     logger('I', '[installed]')
-    initialize()
+    checkServerDefined() // Just to show a warning to set device IP Address
 }
+
 def updated() {
     logger('I', '[updated]')
     initialize()
 }
+
 def initialize() {
     logger('I', '[initialize]')
     unschedule()
@@ -151,7 +171,7 @@ def initialize() {
         device.deviceNetworkId = settings.serverIP
     } else {
         device.deviceNetworkId = "TBD-${device.id}"
-        logger('W', {'Server IP not set. DNI temporarily set to "TBD-ID". Please set Server IP in preferences.'})
+        logger('W', {'Server IP not set. DNI temporarily set to "TBD-[deviceId]". Please set Server IP in preferences.'})
     }
 
     if (settings.pollInterval > 0) {
@@ -164,6 +184,7 @@ def initialize() {
     updateDeviceData()
     configure()
 }
+
 def configure() {
     logger('I', '[configure]')
     setBooleanSetting('websiteIntegration', true)
@@ -248,33 +269,39 @@ def parse(description) {
             break
     }
 }
+
 def motion(value) {
     logger('D', {"[motion] value: ${value}"})
     sendEvent([name:'motion', value:value])
     if (value == 'active') {
-        runIn(settings.motionTimeout, 'motionInactive')
+        runIn(settings.motionTimeout.toInteger(), 'motionInactive')
     }
 }
+
 def motionInactive() {
     sendEvent([name:'motion', value:'inactive'])
 }
+
 def cameraMotion(value) {
     logger('D', {"[cameraMotion]: ${value}"})
     sendEvent([name:'cameraMotion', value:value])
     if (value == 'active') {
-        runIn(settings.motionTimeout, 'cameraMotionInactive')
+        runIn(settings.motionTimeout.toInteger(), 'cameraMotionInactive')
     }
 }
+
 def cameraMotionInactive() {
     sendEvent([name:'cameraMotion', value:'inactive'])
 }
+
 def acceleration(value) {
     logger('D', {"[acceleration]: ${value}"})
     sendEvent([name:'acceleration', value:value])
     if (value == 'active') {
-        runIn(settings.motionTimeout, 'accelerationInactive')
+        runIn(settings.motionTimeout.toInteger(), 'accelerationInactive')
     }
 }
+
 def accelerationInactive() {
     sendEvent([name:'acceleration', value:'inactive'])
 }
@@ -284,87 +311,125 @@ def on() {
     logger('D', '[on]')
     screenOn()
 }
+
 def off() {
     logger('D', '[off]')
-    if (state.siren) {
-        setVolume(state.siren)
-    }
-    state.remove('siren')
-    sendEvent([name:'alarm', value:'off'])
-    sendCommandPost('cmd=stopSound')
     screenOff()
 }
+
 def setLevel(level) {
     logger('D', '[setLevel]')
     setScreenBrightness(level)
     sendEvent([name:'level', value:level])
 }
+
 def beep() {
     logger('D', '[beep]')
     sendCommandPost("cmd=playSound&url=${java.net.URLEncoder.encode(toneFile, 'UTF-8')}")
 }
+
 def launchAppPackage(appPackage) {
     logger('D', '[launchAppPackage]')
     sendCommandPost("cmd=startApplication&package=${java.net.URLEncoder.encode(appPackage, 'UTF-8')}")
 }
+
 def bringFullyToFront() {
     logger('D', '[bringFullyToFront]')
     sendCommandPost('cmd=toForeground')
 }
+
 def restartApp() {
     logger('D', '[restartApp]')
     sendCommandPost('cmd=restartApp')
 }
+
+def rebootDevice() {
+    logger('I', '[rebootDevice]')
+    sendCommandPost('cmd=rebootDevice')
+}
+
 def screenOn() {
     logger('D', '[screenOn]')
     sendCommandPost('cmd=screenOn')
+    sendEvent([name:'switch', value:'on'])
 }
+
 def screenOff() {
     logger('D', '[screenOff]')
     sendCommandPost('cmd=screenOff')
+    sendEvent([name:'switch', value:'off'])
 }
+
 def setScreenBrightness(value) {
     logger('D', {"[setScreenBrightness]: ${value}"})
     sendCommandPost("cmd=setStringSetting&key=screenBrightness&value=${value}")
 }
+
+def setOverlayMessage(text, duration=0) {
+    logger('D', {"[setOverlayMessage] text:${text}, duration:${duration}"})
+    sendCommandPost("cmd=setOverlayMessage&text=${java.net.URLEncoder.encode(text, 'UTF-8')}")
+    if (duration > 0) {
+        runIn(duration.toInteger(), 'clearOverlayMessage')
+    }
+}
+
+def clearOverlayMessage() {
+    logger('D', '[clearOverlayMessage]')
+    sendCommandPost('cmd=setOverlayMessage&text=')
+}
+
+def showToast(text) {
+    logger('D', {"[showToast] text:${text}"})
+    sendCommandPost("cmd=showToast&text=${java.net.URLEncoder.encode(text, 'UTF-8')}")
+}
+
 def triggerMotion() {
     logger('D', '[triggerMotion]')
     sendCommandPost('cmd=triggerMotion')
 }
+
 def touchEnable() {
     logger('D', '[touchEnable]')
     setBooleanSetting('disableAllTouch', false)
     setStringSetting('touchRestriction', '0')
 }
+
 def touchDisable() {
     logger('D', '[touchDisable]')
     setBooleanSetting('disableAllTouch', true)
     setStringSetting('touchRestriction', '1')
 }
+
 def lockKiosk() {
     logger('D', '[lockKiosk]')
     sendCommandPost('cmd=lockKiosk')
 }
+
 def unlockKiosk() {
     logger('D', '[unlockKiosk]')
     sendCommandPost('cmd=unlockKiosk')
 }
+
 def startScreensaver() {
     logger('D', '[startScreensaver]')
     sendCommandPost('cmd=startScreensaver')
 }
+
 def stopScreensaver() {
     logger('D', '[stopScreensaver]')
     sendCommandPost('cmd=stopScreensaver')
 }
+
 def loadURL(url) {
     logger('D', {"[loadURL]: ${url}"})
     sendCommandPost("cmd=loadURL&url=${java.net.URLEncoder.encode(url, 'UTF-8')}")
 }
+
 def loadStartURL() {
     logger('D', '[loadStartURL]')
     sendCommandPost('cmd=loadStartURL')
 }
+
 def speak(text, volume=-1, voice='') {
     logger('D', '[speak]')
     logger('T', {"text,volume,voice:${groovy.xml.XmlUtil.escapeXml(text)},${volume},${voice}"})
@@ -398,13 +463,14 @@ def speak(text, volume=-1, voice='') {
                     text = text.substring(1)
                 }
                 logger('T', {"Updated text:${groovy.xml.XmlUtil.escapeXml(text)}"})
-                sendCommandPost("cmd=textToSpeech&text=${java.net.URLEncoder.encode(text, 'UTF-8')}&queue=${queue}&engine=${java.net.URLEncoder.encode(voice, 'UTF-8')}")
+                sendCommandPost("cmd=textToSpeech${ttsLanguage ? '&locale=' + ttsLanguage : ''}&text=${java.net.URLEncoder.encode(text, 'UTF-8')}&queue=${queue}&engine=${java.net.URLEncoder.encode(voice, 'UTF-8')}")
             }
             break
         default:
             break
     }
 }
+
 def setVolume(volumeLevel) {
     logger('D', '[setVolume]')
     logger('T', {"volumeLevel:${volumeLevel}"})
@@ -421,6 +487,7 @@ def setVolume(volumeLevel) {
         logger('D', 'volumeLevel or volumeStream out of range')
     }
 }
+
 def volumeUp() {
     logger('D', '[volumeUp]')
     def newVolume = state.mute ?: device.currentValue('volume')
@@ -432,6 +499,7 @@ def volumeUp() {
         logger('D', 'No volume currently set')
     }
 }
+
 def volumeDown() {
     logger('D', '[volumeDown]')
     def newVolume = state.mute ?: device.currentValue('volume')
@@ -443,6 +511,7 @@ def volumeDown() {
         logger('D', 'No volume currently set')
     }
 }
+
 def mute() {
     logger('D', '[mute]')
     if (!state.mute) {
@@ -454,6 +523,7 @@ def mute() {
         logger('D', 'Already muted')
     }
 }
+
 def unmute() {
     logger('D', '[unmute]')
     if (state.mute) {
@@ -462,17 +532,13 @@ def unmute() {
         logger('D', 'Not muted')
     }
 }
+
 def refresh() {
     logger('D', '[refresh]')
-    def postParams = [
-        uri: "http://${serverIP}:${serverPort}/?type=json&password=${serverPassword}&cmd=deviceInfo",
-        requestContentType: 'application/json',
-        contentType: 'application/json'
-    ]
-    logger('T', {postParams})
-    asynchttpPost('refreshCallback', postParams, null)
-
+    if (!checkServerDefined()) return
+    asynchttpPost('refreshCallback', getRequestParams('cmd=deviceInfo'), null)
 }
+
 def refreshCallback(response, data) {
     logger('D', '[refreshCallback]')
     logger('T', {"response.status: ${response.status}"})
@@ -544,20 +610,28 @@ def handleBatteryLevel(batteryLevel) {
         sendEvent([name:'battery', value:batteryLevel])
     }
 }
+
 def both() {
     logger('D', '[both]')
     sirenStart('both')
 }
+
 def strobe() {
     logger('D', '[strobe]')
     sirenStart('strobe')
 }
+
 def siren() {
     logger('D', '[siren]')
     sirenStart('siren')
 }
+
 def sirenStart(eventValue) {
-    logger('D', '[sirenStart]')
+    logger('I', '[sirenStart]')
+    if (!sirenFile) {
+        logger('W', 'Siren File URL not set in preferences')
+        return
+    }
     logger('T', {"sirenFile:${sirenFile}"})
     logger('T', {"sirenVolume:${sirenVolume}"})
     logger('T', {"eventValue:${eventValue}"})
@@ -568,34 +642,51 @@ def sirenStart(eventValue) {
         setVolume(sirenVolume)
         sendEvent([name:'alarm', value:eventValue])
         sendCommandPost("cmd=playSound&loop=true&url=${java.net.URLEncoder.encode(sirenFile, 'UTF-8')}")
+        if (settings.clearAlarmInterval > 0) {
+            runIn(settings.clearAlarmInterval.toInteger(), 'sirenStop')
+        }
     } else {
         logger('D', 'sirenFile,sirenVolume or eventValue not set')
     }
 }
+
+def sirenStop() {
+    logger('I', '[sirenStop]')
+    if (state.siren) {
+        setVolume(state.siren)
+        state.remove('siren')
+    }
+    sendEvent([name:'alarm', value:'off'])
+    stopSound()
+}
+
 def playSound(soundFile) {
     logger('D', {"[playSound] soundFile:${soundFile}"})
     sendCommandPost("cmd=playSound&url=${java.net.URLEncoder.encode(soundFile, 'UTF-8')}")
 }
+
 def stopSound() {
     logger('D', '[stopSound]')
     sendCommandPost('cmd=stopSound')
 }
+
 def setBooleanSetting(key, value) {
     logger('D', {"[setBooleanSetting] key,value: ${key},${value}"} )
     sendCommandPost("cmd=setBooleanSetting&key=${key}&value=${value}")
 }
+
 def setStringSetting(key, value) {
     logger('D', {"[setStringSetting] key,value: ${key},${value}"})
     sendCommandPost("cmd=setStringSetting&key=${key}&value=${java.net.URLEncoder.encode(value, 'UTF-8')}")
 }
+
+// *** [ Communication Methods ] **********************************************
 def updateDeviceData() {
     logger('D', '[updateDeviceData]')
-    def httpParams = [
-        uri:"http://${serverIP}:${serverPort}/?type=json&password=${serverPassword}&cmd=deviceInfo",
-        contentType: 'application/json'
-    ]
-    asynchttpGet('updateDeviceDataCallback', httpParams)
+    if (!checkServerDefined()) return
+    asynchttpGet('updateDeviceDataCallback', getRequestParams('cmd=deviceInfo'))
 }
+
 def updateDeviceDataCallback(response, data) {
     logger('D', '[updateDeviceDataCallback]')
     logger('T', {"response status,data: ${response.status},${data}"})
@@ -611,16 +702,19 @@ def updateDeviceDataCallback(response, data) {
     }
 }
 
-// *** [ Communication Methods ] **********************************************
+def checkServerDefined() {
+    def infoSet = serverIP && serverPort && serverPassword
+    if (!infoSet) {
+        logger('W', 'Server (Device) IP, Port or Password not set. Command not sent.')
+    }
+    return infoSet
+}
+
 def sendCommandPost(cmdDetails='') {
     logger('D', '[sendCommandPost]')
+    if (!checkServerDefined()) return
     logger('T', {"cmdDetails:${cmdDetails}"})
-    def postParams = [
-        uri: "http://${serverIP}:${serverPort}/?type=json&password=${serverPassword}&${cmdDetails}",
-        requestContentType: 'application/json',
-        contentType: 'application/json'
-    ]
-    logger('T', {postParams})
+    def postParams = getRequestParams(cmdDetails)
     asynchttpPost('sendCommandCallback', postParams, null)
 }
 
@@ -635,6 +729,17 @@ def sendCommandCallback(response, data) {
     }
 }
 
+def getRequestParams(cmdDetails='') {
+    def params = [
+        uri: "http://${serverIP}:${serverPort}/?type=json&password=${serverPassword}&${cmdDetails}",
+        requestContentType: 'application/json',
+        contentType: 'application/json'
+    ]
+    logger('T', {"Request params: ${params}"})
+    return params
+}
+
+// *** [ Log Methods ] ****************************************************
 private boolean logger(level, message) {
     switch(level) {
         case 'E': log.error(getLogMessage(message)); break

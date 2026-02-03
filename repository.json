@@ -7,7 +7,7 @@
       "category": "Control",
       "location": "https://raw.githubusercontent.com/esimioni/fullykioskbrowser-hubitat-driver/master/packageManifest-fullykioskbrowsercontroller.json",
       "description": "Driver to control Fully Kiosk Browser from Hubitat.",
-      "version": "1.5.0"
+      "version": "1.6.0"
     }
   ]
 }
