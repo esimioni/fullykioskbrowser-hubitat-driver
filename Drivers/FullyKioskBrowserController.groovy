@@ -1,4 +1,4 @@
-// Fully Kiosk Browser Driver 1.60
+// Fully Kiosk Browser Driver 1.70
 // Github: https://github.com/esimioni/fullykioskbrowser-hubitat-driver
 
 // Fork of Original Driver by Gavin Campbell 1.41:
@@ -6,6 +6,13 @@
 // Original Support: https://community.hubitat.com/t/release-fully-kiosk-browser-controller/12223
 /*
 [Change Log]
+    1.70: Added networkStatus attribute to track device connectivity status.
+        : Added support for "Notification" capability with a toggle to display as overlay or toast.
+        : Added commands to capture images from the device camera and screen, with support for base64 image storage in attributes.
+            Screenshot is from the FKB screen, it can't access data from other apps.
+        : Breaking: Removed HealthCheck capability and 'lastActivity' attribute as networkStatus provides better insight into connectivity.
+            It wasn't working properly anyway.
+        : Code cleanup and optimizations.
     1.60: Added a language preference option for TTS.
         : Added support to display overlay messages.
         : Added support to display "toast" notifications.
@@ -87,10 +94,13 @@ metadata {
         capability 'MotionSensor'
         capability 'Configuration'
         capability 'AccelerationSensor'
-        capability 'HealthCheck'
+        capability 'Notification'
+        capability 'ImageCapture'
 
         attribute 'currentPageUrl', 'String'
         attribute 'cameraMotion', 'String'
+        attribute 'image', 'string'
+        attribute 'networkStatus', 'enum', ['online', 'offline', 'unknown']
 
         command 'bringFullyToFront'
         command 'launchAppPackage', ['String']
@@ -102,7 +112,10 @@ metadata {
         command 'screenOn'
         command 'screenOff'
         command 'setScreenBrightness', ['Number']
-        command 'setOverlayMessage', [[name:'Message*', type:'STRING', description:'The message to display.'], [name:'Duration', type:'NUMBER', description:'Seconds to display the message (0 for permanent).']]
+        command 'setOverlayMessage', [
+            [name:'Message*', type:'STRING', description:'The message to display.'], 
+            [name:'Duration', type:'NUMBER', description:'Seconds to display the message (0 for permanent).']
+        ]
         command 'clearOverlayMessage'
         command 'showToast', ['String']
         command 'sirenStop'
@@ -114,6 +127,8 @@ metadata {
         command 'touchDisable'
         command 'lockKiosk'
         command 'unlockKiosk'
+        command 'getCamshot'
+        command 'getScreenshot'
         command 'setBooleanSetting', [[name:'Key*', type:'STRING', description:'The key value associated with the setting to be updated.'],
                                      [name:'Value*:', type:'ENUM', constraints:['true', 'false'], desciption:'The setting to be applied.']]
         command 'setStringSetting', [[name:'Key*', type:'STRING', description:'The key value associated with the setting to be updated.'],
@@ -134,6 +149,8 @@ metadata {
         input(name:'motionTimeout', type:'number', title:'Motion/Acceleration Timeout', description:'Number of seconds before motion/acceleration is reset to inactive.', defaultValue:30, required:true)
         input(name:'pollInterval', type:'number', title:'Polling Interval', description:'Minutes - Enable this option to force polling of the device states. 0 disables it.', range:[0..1440], defaultValue:5, required:true)
         input(name:'clearAlarmInterval', type:'number', title:'Clear Alarm State Interval', description:'Seconds - Enable this option to automatically clear the alarm state and stop the siren after triggering the siren. 0 disables it.', range:[0..86400], defaultValue:60, required:true)
+        input(name:'notificationType', type:'enum', title:'Notification Type', description:'How to display notifications sent via the device.', options:['overlay':'Overlay Message', 'toast':'Toast Notification'], defaultValue:'overlay', required:true)
+        input(name:'imageClearInterval', type:'number', title:'Auto-Clear Image Interval', description:'Seconds - Automatically clear the captured image from current states after this interval. 0 disables it.', range:[0..86400], defaultValue:0, required:true)
         input(name:'reportMotion', type: 'bool', title: 'Report Motion (Sensors)', defaultValue: false)
         input(name:'reportCameraMotion', type: 'bool', title: 'Report Camera Motion', defaultValue: false)
         input(name:'reportAcceleration', type: 'bool', title: 'Report Acceleration', defaultValue: false)
@@ -175,11 +192,15 @@ def initialize() {
     }
 
     if (settings.pollInterval > 0) {
+        state.pollFailures = 0
+        sendEvent([name:'networkStatus', value:'online'])
         schedule("0 0/${pollInterval} * * * ?", 'refresh')
         logger('I', {"Polling scheduled every ${pollInterval} minutes."})
     } else {
         unschedule('refresh')
-        logger('I', {'Polling disabled.'})
+        state.pollFailures = 0
+        sendEvent([name:'networkStatus', value:'unknown'])
+        logger('I', {'Polling disabled. Network status set to unknown.'})
     }
     updateDeviceData()
     configure()
@@ -264,7 +285,6 @@ def parse(description) {
             sendEvent([name:'volume', value:body.value])
             break
         default:
-            sendEvent([name:'checkInterval', value:60])
             logger('E', {"Unknown attribute: ${body.attribute}"})
             break
     }
@@ -323,6 +343,15 @@ def setLevel(level) {
     sendEvent([name:'level', value:level])
 }
 
+def deviceNotification(message) {
+    logger('D', {"[deviceNotification] message:${message}"})
+    if (settings.notificationType == 'toast') {
+        showToast(message)
+    } else {
+        setOverlayMessage(message, 10)
+    }
+}
+
 def beep() {
     logger('D', '[beep]')
     sendCommandPost("cmd=playSound&url=${java.net.URLEncoder.encode(toneFile, 'UTF-8')}")
@@ -367,8 +396,11 @@ def setScreenBrightness(value) {
 
 def setOverlayMessage(text, duration=0) {
     logger('D', {"[setOverlayMessage] text:${text}, duration:${duration}"})
-    sendCommandPost("cmd=setOverlayMessage&text=${java.net.URLEncoder.encode(text, 'UTF-8')}")
-    if (duration > 0) {
+
+    def cmd = "cmd=setOverlayMessage&text=${java.net.URLEncoder.encode(text, 'UTF-8')}"
+    sendCommandPost(cmd)
+    
+    if (duration && duration.toInteger() > 0) {
         runIn(duration.toInteger(), 'clearOverlayMessage')
     }
 }
@@ -428,6 +460,53 @@ def loadURL(url) {
 def loadStartURL() {
     logger('D', '[loadStartURL]')
     sendCommandPost('cmd=loadStartURL')
+}
+
+def getCamshot() {
+    logger('D', '[getCamshot]')
+    if (!checkServerDefined()) return
+    captureImage('cmd=getCamshot')
+}
+
+def getScreenshot() {
+    logger('D', '[getScreenshot]')
+    if (!checkServerDefined()) return
+    captureImage('cmd=getScreenshot')
+}
+
+private captureImage(cmd) {
+    try {
+        def params = [
+            uri: "http://${serverIP}:${serverPort}/?password=${serverPassword}&${cmd}",
+            contentType: 'application/octet-stream'
+        ]
+        httpGet(params) { response ->
+            if (response.status == 200) {
+                def respContentType = response.getContentType()
+                if (!respContentType?.startsWith('image/')) {
+                    logger('W', {"Expected image response but received '${respContentType}'. Check camera permissions and availability on the device."})
+                    return
+                }
+                def imageType = respContentType.contains('png') ? 'png' : 'jpeg'
+                def rawBytes = response.data.bytes
+                def base64Image = rawBytes.encodeBase64().toString()
+                sendEvent(name: "image", value: "<img src='data:image/${imageType};base64,${base64Image}' width='100%'>")
+                logger('I', "Image captured and stored in 'image' attribute")
+                if (settings.imageClearInterval > 0) {
+                    runIn(settings.imageClearInterval.toInteger(), 'clearImage')
+                }
+            } else {
+                logger('E', {"Image capture failed: ${response.status}"})
+            }
+        }
+    } catch (Exception e) {
+        logger('E', {"Error capturing image: ${e.message}"})
+    }
+}
+
+def clearImage() {
+    logger('D', '[clearImage]')
+    sendEvent(name: 'image', value: '')
 }
 
 def speak(text, volume=-1, voice='') {
@@ -543,6 +622,14 @@ def refreshCallback(response, data) {
     logger('D', '[refreshCallback]')
     logger('T', {"response.status: ${response.status}"})
     if (response?.status == 200) {
+        if (state.pollFailures > 0) {
+            logger('I', 'Device responded successfully after previous failures. Resetting poll failure count and updating network status to online.')
+        }
+        state.pollFailures = 0
+        if (device.currentValue('networkStatus') != 'online') {
+            sendEvent([name:'networkStatus', value:'online'])
+            logger('I', 'Device is online.')
+        }
         logger('T', {"response.json: ${response.json}"})
 
         if (settings.reportBattery) {
@@ -596,18 +683,23 @@ def refreshCallback(response, data) {
             }
         }
     } else {
-        logger('E', {"Invalid response: ${response.status}"})
+        state.pollFailures = (state.pollFailures ?: 0) + 1
+        logger('W', {"Invalid response: ${response.status} (failure ${state.pollFailures}/3)"})
+        if (state.pollFailures >= 3) {
+            if (device.currentValue('networkStatus') != 'offline') {
+                sendEvent([name:'networkStatus', value:'offline'])
+                logger('E', 'Device is offline after 3 consecutive poll failures.')
+            }
+            state.pollFailures = 0
+        }
     }
-}
-def ping() {
-    logger('D', '[ping]')
-    refresh()
 }
 
 def handleBatteryLevel(batteryLevel) {
-    if (batteryLevel != device.currentValue('battery')) {
-        logger('I', {"Battery Level: ${batteryLevel}%"})
-        sendEvent([name:'battery', value:batteryLevel])
+    def batteryValue = batteryLevel.toInteger()
+    if (batteryValue != device.currentValue('battery')) {
+        logger('I', {"Battery Level: ${batteryValue}%"})
+        sendEvent([name:'battery', value:batteryValue])
     }
 }
 
@@ -696,7 +788,6 @@ def updateDeviceDataCallback(response, data) {
         device.updateDataValue('deviceManufacturer', response.json.deviceManufacturer)
         device.updateDataValue('androidVersion', response.json.androidVersion)
         device.updateDataValue('deviceModel', response.json.deviceModel)
-        sendEvent([name:'checkInterval', value:60])
     } else {
         logger('E', {"Invalid response: ${response.status}"})
     }
@@ -723,7 +814,6 @@ def sendCommandCallback(response, data) {
     logger('T', {"response.status: ${response.status}"})
     if (response?.status == 200) {
         logger('D', {"response.data: ${response.data}"})
-        sendEvent([name:'checkInterval', value:60])
     } else {
         logger('E', {"Invalid response: ${response.status}"},)
     }

@@ -1,9 +1,9 @@
 {
   "packageName": "Fully Kiosk Browser Controller",
   "author": "Eduardo Simioni/Gavin Campbell",
-  "version": "1.6.0",
+  "version": "1.7.0",
   "minimumHEVersion": "2.1.0",
-  "dateReleased": "2026-02-03",
+  "dateReleased": "2026-02-17",
   "apps": [],
   "drivers": [
 	{
