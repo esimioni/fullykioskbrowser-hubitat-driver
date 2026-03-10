@@ -1,19 +1,28 @@
-// Fully Kiosk Browser Driver 1.70
+// Fully Kiosk Browser Driver 1.7.1
 // Github: https://github.com/esimioni/fullykioskbrowser-hubitat-driver
 
-// Fork of Original Driver by Gavin Campbell 1.41:
+// Fork of Original Driver by Gavin Campbell 1.4.1:
 // Github: https://github.com/GvnCampbell/Hubitat/blob/master/Drivers/FullyKioskBrowserController.groovy
 // Original Support: https://community.hubitat.com/t/release-fully-kiosk-browser-controller/12223
 /*
 [Change Log]
-    1.70: Added networkStatus attribute to track device connectivity status.
+    1.7.1: Added to HPM for easier installation and updates.
+        : Logging system refactored to use numeric levels (1-5) with caching for improved performance.
+        : Unified HTTP response validation via isResponseOk() with proper FKB error status detection.
+        : Better error messages on wrong server password ('please login' detection).
+        : Improved async callback handling for consistent response/data argument order.
+        : Extracted poll failure tracking into dedicated recordPollFailure() method with named threshold constant.
+        : Fixed potential crash in handleBatteryLevel when battery level is null.
+        : clearImage now sets attribute to 'none' instead of empty string for consistency.
+        : Standardized changelog version numbering to semver format.
+    1.7.0: Added networkStatus attribute to track device connectivity status.
         : Added support for "Notification" capability with a toggle to display as overlay or toast.
         : Added commands to capture images from the device camera and screen, with support for base64 image storage in attributes.
             Screenshot is from the FKB screen, it can't access data from other apps.
         : Breaking: Removed HealthCheck capability and 'lastActivity' attribute as networkStatus provides better insight into connectivity.
             It wasn't working properly anyway.
         : Code cleanup and optimizations.
-    1.60: Added a language preference option for TTS.
+    1.6.0: Added a language preference option for TTS.
         : Added support to display overlay messages.
         : Added support to display "toast" notifications.
         : Added command to reboot the device. FKB needs to be provisioned as device owner: https://www.fully-kiosk.com/en/#provisioning
@@ -24,7 +33,7 @@
         : Auto clearing of alarm state after siren is triggered (configurable interval).
         : Breaking: Command 'off' no longer stops the siren, use 'sirenStop'.
         : Code improvements.
-    1.50: Configurable polling interval.
+    1.5.0: Configurable polling interval.
         : States to be updated on Hubitat are now configurable.
         : JS Code injection updated to reduce CPU usage on the tablet and send only configured events.
         : Added cameraMotion event for camera-based motion detection.
@@ -33,55 +42,57 @@
         : Log handling full refactoring.
         : Implemented closure-based logging for better performance.
         : Code cleanup and optimizations.
-    1.41: Fixed speak command. Was broken with Hubitat firmware 2.9.0.
+    1.4.1: Fixed speak command. Was broken with Hubitat firmware 2.9.0.
             This will allow it to work with RM and not give an error.
         : Volume will be set if specified (optional), and voice is passed to the engine (optional)
-    1.40: Requires Fully Kiosk Browser 1.43.1 or newer.
+    1.4.0: Requires Fully Kiosk Browser 1.43.1 or newer.
         : Added auto configuration of webviewMixedContent
             This allows FKB to report in device status to HE from dashboards that use https.
             After upgrading click configure so all the settings get applied.
-    1.39: Added attribute "currentPageUrl"
+    1.3.9: Added attribute "currentPageUrl"
             This attribute is updated with the current page during polling (every minute).
-    1.38: Fixed switch reporting.
-    1.37: Added State Polling option to allow the driver to poll the device for updates instead of the device reporting in.
+    1.3.8: Fixed switch reporting.
+    1.3.7: Added State Polling option to allow the driver to poll the device for updates instead of the device reporting in.
             This solves the issue where the start page is SSL. Reporting will not work back to a non SSL endpoint.
             This will gather the screen brightness,screen state and battery levels only.  Motion will not work.
-    1.36: Added 'restartApp' command. (Thanks tmleafs)
-    1.35: Added 'Battery' capability to track the ... battery.
+    1.3.6: Added 'restartApp' command. (Thanks tmleafs)
+    1.3.5: Added 'Battery' capability to track the ... battery.
         : Added 'Switch' and 'SwitchLevel capabilities to turn the screen on/off and adjust the brightness
         : Added 'AccelerationSensor' capability which triggers when tablet is moved.
         : Added 'updateDeviceData' method to record device settings when the preferences is saved.
         : Added 'HealthCheck' capability. Mainly used to help increment Last Activity when device is responding.
         : Removed lastActivity custom attribute. Reduces event log noise.
-    1.33: Added 'MotionSensor' capability to monitor motion via the tablet camera.
+    1.3.3: Added 'MotionSensor' capability to monitor motion via the tablet camera.
         : deviceNetworkId will now be set to the MAC of the IP Address to handle callbacks from FKB
         : Fixed setStringSetting method
         : Added 'Configure' capability.
-          When you select configure it will configure FKB on the device to send events back to this driver.
-          Configure should be run when making configuration changes.
-          WARNING: selecting this will overwrite any custom javascript code you currently have setup in fully.
-    1.32: If using the FKB TTS Engine, starting text with "!" will cause all messages to be stopped and the new message
+        :  When you select configure it will configure FKB on the device to send events back to this driver.
+        :  Configure should be run when making configuration changes.
+        :  WARNING: selecting this will overwrite any custom javascript code you currently have setup in fully.
+    1.3.2: If using the FKB TTS Engine, starting text with "!" will cause all messages to be stopped and the new message
           to play. Otherwise the message is added to the queue and will play when others are finished. (Requires FKB v1.38+)
         : Sending a "!" TTS message will stop all currently playing messages to stop. (Requires FKB v1.38+)
-    1.31: Updated to use "{ }" instead of "< />" for SSML tags.
-    1.30: Added option to select the TTS engine used.
+    1.3.1: Updated to use "{ }" instead of "< />" for SSML tags.
+    1.3.0: Added option to select the TTS engine used.
             Hubitat (Amazon): https://docs.aws.amazon.com/polly/latest/dg/supportedtags.html
             Fully Kiosk Browser (Google): https://cloud.google.com/text-to-speech/docs/ssml
-    1.24: Added setBooleanSetting,setStringSetting
+    1.2.4: Added setBooleanSetting,setStringSetting
           Added lastActivity attribute
-    1.23: Updated speak() logging to escape XML in logging as speak command can support SSML XML
-    1.22: Updated HTTP calls so URL's are encoded properly
-    1.21: Fixed the import url to be correct
-    1.20: Change speak method to use Hubitat TTS methods. Set voice via Hubitat settings.
-    1.09: Changed volumeStream range to be 1-10 (0 doesn't work)
-          Made adjustements to setVolume to properly test for volumeStream value
-          Added playSound/stopSound commands.
-          Added the AudioVolume mute attributes.
-          Set default attributes when installed.
+    1.2.3: Updated speak() logging to escape XML in logging as speak command can support SSML XML
+    1.2.2: Updated HTTP calls so URL's are encoded properly
+    1.2.1: Fixed the import url to be correct
+    1.2.0: Change speak method to use Hubitat TTS methods. Set voice via Hubitat settings.
+    1.0.9: Changed volumeStream range to be 1-10 (0 doesn't work)
+        : Made adjustements to setVolume to properly test for volumeStream value
+        : Added playSound/stopSound commands.
+        : Added the AudioVolume mute attributes.
+        :Set default attributes when installed.
 */
 
+import groovy.transform.Field
+
 metadata {
-    definition(name: 'Fully Kiosk Browser Controller', namespace: 'esimioni', author: 'Gavin Campbell / Eduardo Simioni', importUrl: 'https://raw.githubusercontent.com/esimioni/fullykioskbrowser-hubitat-driver/refs/heads/master/Drivers/FullyKioskBrowserController.groovy') {
+    definition(name: 'Fully Kiosk Browser Controller', namespace: 'esimioni', author: 'Eduardo Simioni', importUrl: 'https://raw.githubusercontent.com/esimioni/fullykioskbrowser-hubitat-driver/refs/heads/master/Drivers/FullyKioskBrowserController.groovy') {
         capability 'Actuator'
         capability 'Alarm'
         capability 'AudioVolume'
@@ -113,7 +124,7 @@ metadata {
         command 'screenOff'
         command 'setScreenBrightness', ['Number']
         command 'setOverlayMessage', [
-            [name:'Message*', type:'STRING', description:'The message to display.'], 
+            [name:'Message*', type:'STRING', description:'The message to display.'],
             [name:'Duration', type:'NUMBER', description:'Seconds to display the message (0 for permanent).']
         ]
         command 'clearOverlayMessage'
@@ -159,10 +170,14 @@ metadata {
         input(name:'reportBattery', type: 'bool', title: 'Report Battery Level', defaultValue: true)
         input(name:'reportBrightness', type: 'bool', title: 'Report Screen Brightness', defaultValue: false)
         input(name:'reportPageUrl', type: 'bool', title: 'Report Current Page URL', defaultValue: false)
-
-        input(name:'loggingLevel', type:'enum', title:'Logging Level', description:'Set the level of logging.', options:['none', 'debug', 'trace', 'info', 'warn', 'error'], defaultValue:'debug', required:true)
+        input(name:'loggingLevel', type:'enum', title:'Logging level', options: ['1':'Error', '2':'Warning', '3':'Info', '4':'Debug', '5':'Trace'], defaultValue: '3', required: true)
     }
 }
+
+
+@Field static final int POLL_FAILURE_THRESHOLD = 3
+
+@Field int cachedLoggingLevel = -1
 
 // *** [ Initialization Methods ] *********************************************
 def installed() {
@@ -177,6 +192,7 @@ def updated() {
 
 def initialize() {
     logger('I', '[initialize]')
+    updateCachedLoggingLevel()
     unschedule()
 
     def mac = getMACFromIP("${serverIP}")
@@ -399,7 +415,7 @@ def setOverlayMessage(text, duration=0) {
 
     def cmd = "cmd=setOverlayMessage&text=${java.net.URLEncoder.encode(text, 'UTF-8')}"
     sendCommandPost(cmd)
-    
+
     if (duration && duration.toInteger() > 0) {
         runIn(duration.toInteger(), 'clearOverlayMessage')
     }
@@ -481,7 +497,7 @@ private captureImage(cmd) {
             contentType: 'application/octet-stream'
         ]
         httpGet(params) { response ->
-            if (response.status == 200) {
+            if (isResponseOk(response)) {
                 def respContentType = response.getContentType()
                 if (!respContentType?.startsWith('image/')) {
                     logger('W', {"Expected image response but received '${respContentType}'. Check camera permissions and availability on the device."})
@@ -505,8 +521,8 @@ private captureImage(cmd) {
 }
 
 def clearImage() {
-    logger('D', '[clearImage]')
-    sendEvent(name: 'image', value: '')
+    logger('I', '[clearImage]')
+    sendEvent(name: 'image', value: 'none')
 }
 
 def speak(text, volume=-1, voice='') {
@@ -618,10 +634,30 @@ def refresh() {
     asynchttpPost('refreshCallback', getRequestParams('cmd=deviceInfo'), null)
 }
 
+/** Records a poll failure, logs it, and sets device offline after POLL_FAILURE_THRESHOLD consecutive failures. */
+private recordPollFailure(String message) {
+    state.pollFailures = (state.pollFailures ?: 0) + 1
+    logger('W', {"${message} (failure ${state.pollFailures}/${POLL_FAILURE_THRESHOLD})"})
+    if (state.pollFailures >= POLL_FAILURE_THRESHOLD) {
+        if (device.currentValue('networkStatus') != 'offline') {
+            sendEvent([name:'networkStatus', value:'offline'])
+            logger('E', 'Device is offline after 3 consecutive poll failures.')
+        }
+        state.pollFailures = 0
+    }
+}
+
 def refreshCallback(response, data) {
     logger('D', '[refreshCallback]')
-    logger('T', {"response.status: ${response.status}"})
-    if (response?.status == 200) {
+    def resp = (response instanceof String && data != null) ? data : response
+    logger('T', {"response.status: ${resp?.status ?: resp?.getStatus()}"})
+    logger('T', {"response: ${response}"})
+    if (isResponseOk(response, data)) {
+        def json = safeGetResponseJson(resp)
+        if (json == null || !(json instanceof Map)) {
+            recordPollFailure('Response had no valid JSON')
+            return
+        }
         if (state.pollFailures > 0) {
             logger('I', 'Device responded successfully after previous failures. Resetting poll failure count and updating network status to online.')
         }
@@ -630,13 +666,13 @@ def refreshCallback(response, data) {
             sendEvent([name:'networkStatus', value:'online'])
             logger('I', 'Device is online.')
         }
-        logger('T', {"response.json: ${response.json}"})
+        logger('T', {"response.json: ${json}"})
 
         if (settings.reportBattery) {
-            handleBatteryLevel(response.json.batteryLevel)
+            handleBatteryLevel(json.batteryLevel)
         }
         if (settings.reportMotion) {
-            def motionValue = response.json.motionDetected ? 'active' : 'inactive'
+            def motionValue = json.motionDetected ? 'active' : 'inactive'
             if (motionValue != device.currentValue('motion')) {
                 logger('I', {"Motion: ${motionValue}"})
                 sendEvent([name:'motion', value:motionValue])
@@ -644,58 +680,52 @@ def refreshCallback(response, data) {
         }
 
         if (settings.reportCameraMotion) {
-            def cameraMotionValue = response.json.motionDetected ? 'active' : 'inactive'
+            def cameraMotionValue = json.motionDetected ? 'active' : 'inactive'
             if (cameraMotionValue != device.currentValue('cameraMotion')) {
                 logger('I', {"Camera Motion: ${cameraMotionValue}"})
                 sendEvent([name:'cameraMotion', value:cameraMotionValue])
             }
         }
         if (settings.reportAcceleration) {
-            def accelerationValue = response.json.movementDetected ? 'active' : 'inactive'
+            def accelerationValue = json.movementDetected ? 'active' : 'inactive'
             if (accelerationValue != device.currentValue('acceleration')) {
                 logger('I', {"Acceleration: ${accelerationValue}"})
                 sendEvent([name:'acceleration', value:accelerationValue])
             }
         }
         if (settings.reportVolume) {
-            if (response.json.audioVolume != device.currentValue('volume')) {
-                logger('I', {"Volume: ${response.json.audioVolume}"})
-                sendEvent([name:'volume', value:response.json.audioVolume])
+            if (json.audioVolume != device.currentValue('volume')) {
+                logger('I', {"Volume: ${json.audioVolume}"})
+                sendEvent([name:'volume', value:json.audioVolume])
             }
         }
         if (settings.reportSwitch) {
-            def switchValue = (response.json.screenOn == true) ? 'on' : 'off'
+            def switchValue = (json.screenOn == true) ? 'on' : 'off'
             if (switchValue != device.currentValue('switch')) {
                 logger('I', {"Switch: ${switchValue}"})
                 sendEvent([name:'switch', value:switchValue])
             }
         }
-        if (settings.reportBrightness && response.json.screenBrightness != null) {
-            if (response.json.screenBrightness != device.currentValue('level')) {
-                logger('I', {"Brightness Level: ${response.json.screenBrightness}"})
-                sendEvent([name:'level', value:response.json.screenBrightness])
+        if (settings.reportBrightness && json.screenBrightness != null) {
+            if (json.screenBrightness != device.currentValue('level')) {
+                logger('I', {"Brightness Level: ${json.screenBrightness}"})
+                sendEvent([name:'level', value:json.screenBrightness])
             }
         }
-        if (settings.reportPageUrl && response.json.currentPage != null) {
-            if (response.json.currentPage != device.currentValue('currentPageUrl')) {
-                logger('I', {"Current Page URL: ${response.json.currentPage}"})
-                sendEvent([name:'currentPageUrl', value:response.json.currentPage])
+        if (settings.reportPageUrl && json.currentPage != null) {
+            if (json.currentPage != device.currentValue('currentPageUrl')) {
+                logger('I', {"Current Page URL: ${json.currentPage}"})
+                sendEvent([name:'currentPageUrl', value:json.currentPage])
             }
         }
     } else {
-        state.pollFailures = (state.pollFailures ?: 0) + 1
-        logger('W', {"Invalid response: ${response.status} (failure ${state.pollFailures}/3)"})
-        if (state.pollFailures >= 3) {
-            if (device.currentValue('networkStatus') != 'offline') {
-                sendEvent([name:'networkStatus', value:'offline'])
-                logger('E', 'Device is offline after 3 consecutive poll failures.')
-            }
-            state.pollFailures = 0
-        }
+        def fkbMessage = safeGetResponseJson(resp)?.statustext ?: (resp?.status ?: resp?.getStatus())
+        recordPollFailure("Invalid response: ${fkbMessage}")
     }
 }
 
 def handleBatteryLevel(batteryLevel) {
+    if (batteryLevel == null) return
     def batteryValue = batteryLevel.toInteger()
     if (batteryValue != device.currentValue('battery')) {
         logger('I', {"Battery Level: ${batteryValue}%"})
@@ -781,15 +811,21 @@ def updateDeviceData() {
 
 def updateDeviceDataCallback(response, data) {
     logger('D', '[updateDeviceDataCallback]')
-    logger('T', {"response status,data: ${response.status},${data}"})
-    if (response.status == 200) {
-        logger({"response.json: ${response.json}"}, 'debug')
-        device.updateDataValue('appVersionName', response.json.appVersionName)
-        device.updateDataValue('deviceManufacturer', response.json.deviceManufacturer)
-        device.updateDataValue('androidVersion', response.json.androidVersion)
-        device.updateDataValue('deviceModel', response.json.deviceModel)
+    def resp = (response instanceof String && data != null) ? data : response
+    logger('T', {"response status,data: ${resp?.status ?: resp?.getStatus()},${response instanceof String ? response : data}"})
+    if (isResponseOk(response, data)) {
+        logger({"response.json: ${resp.json}"}, 'debug')
+        device.updateDataValue('appVersionName', resp.json.appVersionName)
+        device.updateDataValue('deviceManufacturer', resp.json.deviceManufacturer)
+        device.updateDataValue('androidVersion', resp.json.androidVersion)
+        device.updateDataValue('deviceModel', resp.json.deviceModel)
     } else {
-        logger('E', {"Invalid response: ${response.status}"})
+        def statustext = (resp?.json instanceof Map) ? resp.json.statustext : null
+        if (statustext?.toString()?.toLowerCase()?.contains('please login')) {
+            logger('E', {"FKB returned '${statustext}'. The server password in preferences may be wrong."})
+        } else {
+            logger('E', {"Invalid response: ${statustext ?: (resp?.status ?: resp?.getStatus())}"})
+        }
     }
 }
 
@@ -811,11 +847,12 @@ def sendCommandPost(cmdDetails='') {
 
 def sendCommandCallback(response, data) {
     logger('D', '[sendCommandCallback]')
-    logger('T', {"response.status: ${response.status}"})
-    if (response?.status == 200) {
-        logger('D', {"response.data: ${response.data}"})
+    def resp = (response instanceof String && data != null) ? data : response
+    logger('T', {"response.status: ${resp?.status ?: resp?.getStatus()}"})
+    if (isResponseOk(response, data)) {
+        logger('D', {"response.data: ${resp.data}"})
     } else {
-        logger('E', {"Invalid response: ${response.status}"},)
+        logger('E', {"Invalid response: ${resp?.status ?: resp?.getStatus()}"})
     }
 }
 
@@ -829,27 +866,58 @@ def getRequestParams(cmdDetails='') {
     return params
 }
 
+/** Returns response JSON map or null; never throws (e.g. when response has no JSON or getter throws). */
+private safeGetResponseJson(resp) {
+    if (resp == null) return null
+    try {
+        def j = resp.json
+        return (j instanceof Map) ? j : null
+    } catch (Exception e) {
+        return null
+    }
+}
+
+/** Returns true if HTTP response is 200 and (for JSON) FKB did not return status/Error. Safe for binary responses (e.g. image) and async (response/data) argument order. */
+def isResponseOk(response, data = null) {
+    def resp = (response instanceof String && data != null) ? data : response
+    def httpStatus = (resp?.respondsTo('getStatus') ? resp.getStatus() : null) ?: resp?.status
+    if (httpStatus != 200) return false
+    // FKB JSON may be in .json (async) or .data (sync); sync HttpResponseDecorator has no .json. Only read .json if present.
+    def payload = null
+    if (resp?.data instanceof Map) payload = resp.data
+    else if (resp?.hasProperty('json') && resp.json instanceof Map) payload = resp.json
+    if (payload != null && payload.status == 'Error') return false
+    if (payload != null && payload.status != null && payload.status != 'OK') return false
+    return true
+}
+
 // *** [ Log Methods ] ****************************************************
-private boolean logger(level, message) {
-    switch(level) {
-        case 'E': log.error(getLogMessage(message)); break
-        case 'W': log.warn(getLogMessage(message)); break
-        case 'I':
-            if (loggingLevel == 'debug' || loggingLevel == 'trace' || loggingLevel == 'info')
-                log.info(getLogMessage(message))
-            break
-        case 'D':
-            if (loggingLevel == 'debug' || loggingLevel == 'trace')
-                log.debug(getLogMessage(message))
-            break
-        case 'T':
-            if (loggingLevel == 'trace')
-                log.trace(getLogMessage(message))
-            break
+private void logger(level, message) {
+    int configuredLevel = getCachedLoggingLevel()
+    switch (level) {
+        case 'E': if (configuredLevel >= 1) { log.error(getLogMessage(message)) }; break
+        case 'W': if (configuredLevel >= 2) { log.warn(getLogMessage(message)) }; break
+        case 'I': if (configuredLevel >= 3) { log.info(getLogMessage(message)) }; break
+        case 'D': if (configuredLevel >= 4) { log.debug(getLogMessage(message)) }; break
+        case 'T': if (configuredLevel >= 5) { log.trace(getLogMessage(message)) }; break
     }
 }
 
 private String getLogMessage(message) {
     def text = (message instanceof Closure) ? message() : message
     return "${device.displayName}: ${text}"
+}
+
+private void updateCachedLoggingLevel() {
+    cachedLoggingLevel = safeToInt(settings.loggingLevel, 3)
+}
+
+private int getCachedLoggingLevel() {
+    if (cachedLoggingLevel >= 0) return cachedLoggingLevel
+     cachedLoggingLevel = (settings.loggingLevel as String)?.toInteger() ?: 3
+    return cachedLoggingLevel
+}
+
+Integer safeToInt(val, Integer defaultVal=0) {
+    return "${val}"?.isInteger() ? "${val}".toInteger() : defaultVal
 }
