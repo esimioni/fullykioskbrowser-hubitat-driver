@@ -1,4 +1,4 @@
-// Fully Kiosk Browser Driver 1.7.1
+// Fully Kiosk Browser Driver 1.8.0
 // Github: https://github.com/esimioni/fullykioskbrowser-hubitat-driver
 
 // Fork of Original Driver by Gavin Campbell 1.4.1:
@@ -6,6 +6,31 @@
 // Original Support: https://community.hubitat.com/t/release-fully-kiosk-browser-controller/12223
 /*
 [Change Log]
+    1.8.0 (unreleased): Battery level reports are throttled to at most one every 30 s, so devices that fire
+            onBatteryLevelChanged dozens of times per second no longer flood the hub. The 15-minute fallback
+            report is unchanged.
+        : Server passwords with special characters (& # + % or a space) now work: the password is URL-encoded.
+        : When the tablet's MAC address can't be found, the device network ID is now its IP address in hex, which
+            the hub routes. The plain IP used before made the hub silently drop the tablet's reports.
+        : Polling intervals of 60 minutes or more now work (they produced an invalid schedule), and intervals that
+            don't divide an hour now poll at a steady pace.
+        : Volume: volumeUp works from 0, mute remembers the right volume, and a volume of 0 is restored after the
+            siren and after unmute (it came back as 100%).
+        : Full capability contracts: take() captures a camera image, and setLevel() accepts a duration (ignored).
+        : Breaking: setLevel() and the 'level' attribute now use 0-100% and are converted to the tablet's 0-255
+            brightness (setLevel(50) was giving ~20%). setScreenBrightness still takes the raw 0-255 value.
+        : speak() applies the requested volume with both TTS engines, and no longer fails when voice is null.
+        : Runs single threaded (requires hub firmware 2.2.9 or newer), so concurrent executions can't overwrite each
+            other's state, e.g. losing the volume to restore after the siren.
+        : Commands that depend on each other are sent in order: the start page reloads only after the tablet stores
+            the new script, and sounds play only after their volume is set.
+        : Saving preferences no longer cancels a pending siren auto-stop, motion timeout or overlay/image clear.
+        : A timed overlay message no longer clears a permanent one sent after it.
+        : Polling no longer overwrites motion, acceleration, volume or screen state when the tablet doesn't report
+            them, and the network status is checked right after saving instead of assumed online.
+        : The server password is masked in the preferences and in trace logs. Minor fixes and cleanups.
+        : After updating, click "Save Preferences" (or "Configure") on each device so the new script reaches the
+            tablet. This reloads the tablet's start page.
     1.7.1: Added to HPM for easier installation and updates.
         : Logging system refactored to use numeric levels (1-5) with caching for improved performance.
         : Unified HTTP response validation via isResponseOk() with proper FKB error status detection.
@@ -90,9 +115,13 @@
 */
 
 import groovy.transform.Field
+import java.math.RoundingMode
 
 metadata {
-    definition(name: 'Fully Kiosk Browser Controller', namespace: 'esimioni', author: 'Eduardo Simioni', importUrl: 'https://raw.githubusercontent.com/esimioni/fullykioskbrowser-hubitat-driver/refs/heads/master/Drivers/FullyKioskBrowserController.groovy') {
+    // singleThreaded: without it, each execution loads a snapshot of state and saves the whole map when it ends,
+    // so two overlapping executions (a command and a poll or a push from the tablet) could silently undo each
+    // other's writes — e.g. lose state.siren and leave the volume at the siren's level. Requires HE 2.2.9+.
+    definition(name: 'Fully Kiosk Browser Controller', namespace: 'esimioni', author: 'Eduardo Simioni', singleThreaded: true, importUrl: 'https://raw.githubusercontent.com/esimioni/fullykioskbrowser-hubitat-driver/refs/heads/master/Drivers/FullyKioskBrowserController.groovy') {
         capability 'Actuator'
         capability 'Alarm'
         capability 'AudioVolume'
@@ -122,7 +151,7 @@ metadata {
         command 'rebootDevice'
         command 'screenOn'
         command 'screenOff'
-        command 'setScreenBrightness', ['Number']
+        command 'setScreenBrightness', [[name:'Brightness*', type:'NUMBER', description:'Raw Fully Kiosk Browser value, 0-255. setLevel() takes 0-100%.']]
         command 'setOverlayMessage', [
             [name:'Message*', type:'STRING', description:'The message to display.'],
             [name:'Duration', type:'NUMBER', description:'Seconds to display the message (0 for permanent).']
@@ -141,14 +170,14 @@ metadata {
         command 'getCamshot'
         command 'getScreenshot'
         command 'setBooleanSetting', [[name:'Key*', type:'STRING', description:'The key value associated with the setting to be updated.'],
-                                     [name:'Value*:', type:'ENUM', constraints:['true', 'false'], desciption:'The setting to be applied.']]
+                                     [name:'Value*', type:'ENUM', constraints:['true', 'false'], description:'The setting to be applied.']]
         command 'setStringSetting', [[name:'Key*', type:'STRING', description:'The key value associated with the setting to be updated.'],
-                                     [name:'Value*:', type:'STRING', desciption:'The setting to be applied.']]
+                                     [name:'Value*', type:'STRING', description:'The setting to be applied.']]
     }
     preferences {
         input(name:'serverIP', type:'string', title:'Server IP Address', description:'Device IP', defaultValue:'', required:true)
         input(name:'serverPort', type:'string', title:'Server Port', defaultValue:'2323', required:true)
-        input(name:'serverPassword', type:'string', title:'Server Password', defaultValue:'', required:true)
+        input(name:'serverPassword', type:'password', title:'Server Password', defaultValue:'', required:true)
         input(name:'toneFile', type:'string', title:'Tone Audio File URL', defaultValue:'', required:false)
         input(name:'sirenFile', type:'string', title:'Siren Audio File URL', defaultValue:'', required:false)
         input(name:'sirenVolume', type:'integer', title:'Siren Volume (0-100)', range:[0..100], defaultValue:'100', required:false)
@@ -176,6 +205,8 @@ metadata {
 
 
 @Field static final int POLL_FAILURE_THRESHOLD = 3
+@Field static final int BATTERY_REPORT_INTERVAL_MS = 30000
+@Field static final String CMD_LOAD_START_URL = 'cmd=loadStartURL'
 
 @Field int cachedLoggingLevel = -1
 
@@ -193,33 +224,68 @@ def updated() {
 def initialize() {
     logger('I', '[initialize]')
     updateCachedLoggingLevel()
-    unschedule()
+    // Only the polling jobs: a full unschedule() also cancelled a pending siren auto-stop, motion timeout or
+    // overlay/image clear, leaving the siren looping or motion stuck 'active' after a Save Preferences.
+    unschedule('refresh')
+    unschedule('pollTick')
+    updateDeviceNetworkId()
+    schedulePolling()
+    updateDeviceData()
+    configure()
+}
 
-    def mac = getMACFromIP("${serverIP}")
+private void updateDeviceNetworkId() {
+    def mac = settings.serverIP ? getMACFromIP("${settings.serverIP}") : null
+    String ipHex = ipToHex(settings.serverIP)
     if (mac) {
         logger('I', {"MAC address found. Updating deviceNetworkId: ${mac}"})
         device.deviceNetworkId = mac
+    } else if (ipHex) {
+        // The hub routes the tablet's reports by DNI = MAC, or IP in hex; it never matches a dotted IP.
+        logger('I', {"MAC address not found. Setting deviceNetworkId to the IP address in hex: ${ipHex}"})
+        device.deviceNetworkId = ipHex
     } else if (settings.serverIP) {
-        logger('I', {"MAC address not found. Setting deviceNetworkId to ip address: ${settings.serverIP}"})
+        logger('W', {"Server IP '${settings.serverIP}' is not an IPv4 address, so the tablet's reports can't reach this device. Use the tablet's IP address."})
         device.deviceNetworkId = settings.serverIP
     } else {
         device.deviceNetworkId = "TBD-${device.id}"
         logger('W', {'Server IP not set. DNI temporarily set to "TBD-[deviceId]". Please set Server IP in preferences.'})
     }
+}
 
-    if (settings.pollInterval > 0) {
-        state.pollFailures = 0
-        sendEvent([name:'networkStatus', value:'online'])
-        schedule("0 0/${pollInterval} * * * ?", 'refresh')
-        logger('I', {"Polling scheduled every ${pollInterval} minutes."})
-    } else {
-        unschedule('refresh')
-        state.pollFailures = 0
+private void schedulePolling() {
+    state.pollFailures = 0
+    int minutes = safeToInt(settings.pollInterval, 0)
+    if (minutes <= 0) {
         sendEvent([name:'networkStatus', value:'unknown'])
         logger('I', {'Polling disabled. Network status set to unknown.'})
+        return
     }
-    updateDeviceData()
-    configure()
+    String cron = pollCron(minutes)
+    if (cron) {
+        schedule(cron, 'refresh')
+    } else {
+        runIn(minutes * 60, 'pollTick')
+    }
+    logger('I', {"Polling scheduled every ${minutes} minutes."})
+    if (device.currentValue('networkStatus') == null) {
+        sendEvent([name:'networkStatus', value:'unknown'])
+    }
+    // Check the tablet now, instead of assuming it's online until the first scheduled poll.
+    runIn(3, 'initialPoll')
+}
+
+/** Polls at an interval no cron can keep (see pollCron): each poll schedules the next one before it runs. */
+def pollTick() {
+    int minutes = safeToInt(settings.pollInterval, 0)
+    if (minutes > 0 && pollCron(minutes) == null) {
+        runIn(minutes * 60, 'pollTick')
+    }
+    refresh()
+}
+
+def initialPoll() {
+    refresh()
 }
 
 def configure() {
@@ -257,21 +323,25 @@ def configure() {
         jsCode += "fully.bind('onScreenOff','sendAttributeValue(\\'switch\\',\\'off\\');');\n"
     }
     if (settings.reportBattery) {
-        jsCode += "fully.bind('onBatteryLevelChanged','sendAttributeValue(\\'battery\\',\\'\\');');\n"
-        // Also report battery every 15 minutes as a fallback
-        jsCode += "setInterval(function(){sendAttributeValue('battery','');}, 900000);\n"
+        jsCode += batteryJs(BATTERY_REPORT_INTERVAL_MS)
     }
 
-    setStringSetting('injectJsCode', jsCode)
-    setBooleanSetting('motionDetection', (settings.reportMotion == true || settings.reportCameraMotion == true))
+    setBooleanSetting('motionDetection', settings.reportMotion == true || settings.reportCameraMotion == true)
     setBooleanSetting('movementDetection', settings.reportAcceleration == true)
+    // The page runs injectJsCode only when it loads, and the commands are asynchronous: reload the start page
+    // only after the tablet has stored the new code, or a reload that wins the race keeps the old script.
+    sendStringSetting('injectJsCode', jsCode, CMD_LOAD_START_URL)
+}
 
-    // Explicitly disable camera motion if not requested to save CPU
-    if (!settings.reportCameraMotion) {
-        setBooleanSetting('motionDetection', settings.reportMotion == true)
-    }
-
-    loadStartURL()
+/**
+ * The battery part of the injected script. Throttled: onBatteryLevelChanged can fire dozens of times per second
+ * on some devices, so a change arms one report intervalMs later and the events until then ride along. Unlike a
+ * debounce, a device that never stops firing still reports once per interval. Plus a 15-minute fallback report.
+ */
+String batteryJs(int intervalMs) {
+    return "var _battTimer=null; function _throttleBatt(){if(_battTimer)return;_battTimer=setTimeout(function(){_battTimer=null;sendAttributeValue('battery','');},${intervalMs});}\n" +
+            "fully.bind('onBatteryLevelChanged','_throttleBatt();');\n" +
+            "setInterval(function(){sendAttributeValue('battery','');}, 900000);\n"
 }
 
 // *** [ Parsing Methods ] ****************************************************
@@ -307,11 +377,7 @@ def parse(description) {
 }
 
 def motion(value) {
-    logger('D', {"[motion] value: ${value}"})
-    sendEvent([name:'motion', value:value])
-    if (value == 'active') {
-        runIn(settings.motionTimeout.toInteger(), 'motionInactive')
-    }
+    reportTimedActivity('motion', value, 'motionInactive')
 }
 
 def motionInactive() {
@@ -319,11 +385,7 @@ def motionInactive() {
 }
 
 def cameraMotion(value) {
-    logger('D', {"[cameraMotion]: ${value}"})
-    sendEvent([name:'cameraMotion', value:value])
-    if (value == 'active') {
-        runIn(settings.motionTimeout.toInteger(), 'cameraMotionInactive')
-    }
+    reportTimedActivity('cameraMotion', value, 'cameraMotionInactive')
 }
 
 def cameraMotionInactive() {
@@ -331,15 +393,21 @@ def cameraMotionInactive() {
 }
 
 def acceleration(value) {
-    logger('D', {"[acceleration]: ${value}"})
-    sendEvent([name:'acceleration', value:value])
-    if (value == 'active') {
-        runIn(settings.motionTimeout.toInteger(), 'accelerationInactive')
-    }
+    reportTimedActivity('acceleration', value, 'accelerationInactive')
 }
 
 def accelerationInactive() {
     sendEvent([name:'acceleration', value:'inactive'])
+}
+
+/** Sends the event and, when active, schedules the handler that resets it after the motion timeout. */
+private void reportTimedActivity(String attribute, value, String inactiveHandler) {
+    logger('D', {"[${attribute}] value: ${value}"})
+    sendEvent([name:attribute, value:value])
+    if (value == 'active') {
+        // Defaults to 30 s when the preference was never saved (e.g. right after upgrading from an older version).
+        runIn(safeToInt(settings.motionTimeout, 30), inactiveHandler)
+    }
 }
 
 // *** [ Device Methods ] *****************************************************
@@ -353,10 +421,16 @@ def off() {
     screenOff()
 }
 
-def setLevel(level) {
-    logger('D', '[setLevel]')
-    setScreenBrightness(level)
-    sendEvent([name:'level', value:level])
+/** SwitchLevel: level is 0-100%, the tablet's brightness 0-255. The capability's duration is accepted and ignored. */
+def setLevel(level, duration = null) {
+    logger('D', {"[setLevel] level: ${level}"})
+    Integer brightness = levelToBrightness(level)
+    if (brightness == null) {
+        logger('W', {"setLevel: '${level}' is not a number"})
+        return
+    }
+    setScreenBrightness(brightness)
+    sendEvent([name:'level', value:brightnessToLevel(brightness), unit:'%'])
 }
 
 def deviceNotification(message) {
@@ -370,12 +444,16 @@ def deviceNotification(message) {
 
 def beep() {
     logger('D', '[beep]')
-    sendCommandPost("cmd=playSound&url=${java.net.URLEncoder.encode(toneFile, 'UTF-8')}")
+    if (!toneFile) {
+        logger('W', 'Tone Audio File URL not set in preferences')
+        return
+    }
+    sendCommandPost(playSoundCmd(toneFile))
 }
 
 def launchAppPackage(appPackage) {
     logger('D', '[launchAppPackage]')
-    sendCommandPost("cmd=startApplication&package=${java.net.URLEncoder.encode(appPackage, 'UTF-8')}")
+    sendCommandPost("cmd=startApplication&package=${urlEncode(appPackage)}")
 }
 
 def bringFullyToFront() {
@@ -412,12 +490,12 @@ def setScreenBrightness(value) {
 
 def setOverlayMessage(text, duration=0) {
     logger('D', {"[setOverlayMessage] text:${text}, duration:${duration}"})
-
-    def cmd = "cmd=setOverlayMessage&text=${java.net.URLEncoder.encode(text, 'UTF-8')}"
-    sendCommandPost(cmd)
-
-    if (duration && duration.toInteger() > 0) {
-        runIn(duration.toInteger(), 'clearOverlayMessage')
+    // A pending clear belongs to the previous message: left alone it would erase this one, even a permanent one.
+    unschedule('clearOverlayMessage')
+    sendCommandPost("cmd=setOverlayMessage&text=${urlEncode(text)}")
+    int seconds = safeToInt(duration, 0)
+    if (seconds > 0) {
+        runIn(seconds, 'clearOverlayMessage')
     }
 }
 
@@ -428,7 +506,7 @@ def clearOverlayMessage() {
 
 def showToast(text) {
     logger('D', {"[showToast] text:${text}"})
-    sendCommandPost("cmd=showToast&text=${java.net.URLEncoder.encode(text, 'UTF-8')}")
+    sendCommandPost("cmd=showToast&text=${urlEncode(text)}")
 }
 
 def triggerMotion() {
@@ -470,12 +548,18 @@ def stopScreensaver() {
 
 def loadURL(url) {
     logger('D', {"[loadURL]: ${url}"})
-    sendCommandPost("cmd=loadURL&url=${java.net.URLEncoder.encode(url, 'UTF-8')}")
+    sendCommandPost("cmd=loadURL&url=${urlEncode(url)}")
 }
 
 def loadStartURL() {
     logger('D', '[loadStartURL]')
-    sendCommandPost('cmd=loadStartURL')
+    sendCommandPost(CMD_LOAD_START_URL)
+}
+
+/** ImageCapture: take() is the capability's command. */
+def take() {
+    logger('D', '[take]')
+    getCamshot()
 }
 
 def getCamshot() {
@@ -493,7 +577,7 @@ def getScreenshot() {
 private captureImage(cmd) {
     try {
         def params = [
-            uri: "http://${serverIP}:${serverPort}/?password=${serverPassword}&${cmd}",
+            uri: fkbUrl(serverIP, serverPort, serverPassword, cmd, false),
             contentType: 'application/octet-stream'
         ]
         httpGet(params) { response ->
@@ -527,9 +611,15 @@ def clearImage() {
 
 def speak(text, volume=-1, voice='') {
     logger('D', '[speak]')
+    if (text == null) {
+        logger('W', 'speak: no text given')
+        return
+    }
+    text = "${text}"
     logger('T', {"text,volume,voice:${groovy.xml.XmlUtil.escapeXml(text)},${volume},${voice}"})
     logger('T', {"settings.ttsEngine: ${settings.ttsEngine}"})
     text = text.replace('{', '<').replace('}', '/>')
+    Integer speakVolume = parseSpeakVolume(volume)
     switch ("${settings.ttsEngine}") {
         case 'null':
         case '0':
@@ -541,13 +631,12 @@ def speak(text, volume=-1, voice='') {
                 if (text.startsWith('!')) {
                     text = text.substring(1)
                 }
-                def sound = textToSpeech(text, voice)
+                def sound = textToSpeech(text, voice ?: '')
                 logger('T', {"sound.uri: ${sound.uri}"})
                 logger('T', {"sound.duration: ${sound.duration}"})
-                if (volume != -1) setVolume(volume)
-                playSound(sound.uri)
+                playAfterVolume(speakVolume, playSoundCmd(sound.uri))
             }
-           break
+            break
         case '1':
             if (text == '!') {
                 sendCommandPost('cmd=stopTextToSpeech')
@@ -558,7 +647,8 @@ def speak(text, volume=-1, voice='') {
                     text = text.substring(1)
                 }
                 logger('T', {"Updated text:${groovy.xml.XmlUtil.escapeXml(text)}"})
-                sendCommandPost("cmd=textToSpeech${ttsLanguage ? '&locale=' + ttsLanguage : ''}&text=${java.net.URLEncoder.encode(text, 'UTF-8')}&queue=${queue}&engine=${java.net.URLEncoder.encode(voice, 'UTF-8')}")
+                String locale = ttsLanguage ? "&locale=${urlEncode(ttsLanguage)}" : ''
+                playAfterVolume(speakVolume, "cmd=textToSpeech${locale}&text=${urlEncode(text)}&queue=${queue}&engine=${urlEncode(voice)}")
             }
             break
         default:
@@ -566,63 +656,76 @@ def speak(text, volume=-1, voice='') {
     }
 }
 
+/** Sends playCmd — after setting the volume, when one was given, and only once the tablet has answered it. */
+private void playAfterVolume(Integer volume, String playCmd) {
+    if (volume != null) {
+        sendVolume(volume, playCmd)
+    } else {
+        sendCommandPost(playCmd)
+    }
+}
+
 def setVolume(volumeLevel) {
     logger('D', '[setVolume]')
+    sendVolume(volumeLevel)
+}
+
+/** Sets the volume of the configured stream. nextCmd, if any, is sent after the tablet answers (see sendCommandPost). */
+private void sendVolume(volumeLevel, String nextCmd = null) {
     logger('T', {"volumeLevel:${volumeLevel}"})
     logger('T', {"volumeStream:${volumeStream}"})
-    def vl = volumeLevel.toInteger()
-    def vs = volumeStream.toInteger()
+    Integer vl = toIntOrNull(volumeLevel)
+    Integer vs = toIntOrNull(volumeStream)
 
-    if (vl >= 0 && vl <= 100 && vs >= 1 && vs <= 10) {
-        sendCommandPost("cmd=setAudioVolume&level=${vl}&stream=${vs}")
+    if (vl != null && vl >= 0 && vl <= 100 && vs != null && vs >= 1 && vs <= 10) {
+        sendCommandPost("cmd=setAudioVolume&level=${vl}&stream=${vs}", nextCmd)
         sendEvent([name:'volume', value:vl])
         state.remove('mute')
         sendEvent([name:'mute', value:'unmuted'])
     } else {
         logger('D', 'volumeLevel or volumeStream out of range')
+        if (nextCmd) sendCommandPost(nextCmd)
     }
 }
 
 def volumeUp() {
     logger('D', '[volumeUp]')
-    def newVolume = state.mute ?: device.currentValue('volume')
-    if (newVolume) {
-        newVolume = newVolume.toInteger() + 10
-        newVolume = Math.min(newVolume, 100)
-        setVolume(newVolume)
-    } else {
-        logger('D', 'No volume currently set')
-    }
+    stepVolume(10)
 }
 
 def volumeDown() {
     logger('D', '[volumeDown]')
-    def newVolume = state.mute ?: device.currentValue('volume')
-    if (newVolume) {
-        newVolume = newVolume.toInteger() - 10
-        newVolume = Math.max(newVolume, 0)
-        setVolume(newVolume)
-    } else {
+    stepVolume(-10)
+}
+
+private void stepVolume(int delta) {
+    // While muted, state.mute holds the volume from before mute(): stepping from it also unmutes.
+    Integer target = volumeTarget(state.mute, device.currentValue('volume'), delta)
+    if (target == null) {
         logger('D', 'No volume currently set')
+        return
     }
+    sendVolume(target)
 }
 
 def mute() {
     logger('D', '[mute]')
-    if (!state.mute) {
-        setVolume(0)
-        state.mute = device.currentValue('volume') ?: 100
-        sendEvent([name:'mute', value:'muted'])
-        logger('T', {"Previous volume saved to state.mute:${state.mute}"})
-    } else {
+    if (state.mute != null) {
         logger('D', 'Already muted')
+        return
     }
+    // Read before zeroing: read after, the volume could already be 0, and unmute would then restore 100%.
+    Integer previous = volumeToRestore(null, device.currentValue('volume'))
+    sendVolume(0)
+    state.mute = previous
+    sendEvent([name:'mute', value:'muted'])
+    logger('T', {"Previous volume saved to state.mute:${state.mute}"})
 }
 
 def unmute() {
     logger('D', '[unmute]')
-    if (state.mute) {
-        setVolume(state.mute)
+    if (state.mute != null) {
+        sendVolume(state.mute)
     } else {
         logger('D', 'Not muted')
     }
@@ -641,7 +744,7 @@ private recordPollFailure(String message) {
     if (state.pollFailures >= POLL_FAILURE_THRESHOLD) {
         if (device.currentValue('networkStatus') != 'offline') {
             sendEvent([name:'networkStatus', value:'offline'])
-            logger('E', 'Device is offline after 3 consecutive poll failures.')
+            logger('E', "Device is offline after ${POLL_FAILURE_THRESHOLD} consecutive poll failures.")
         }
         state.pollFailures = 0
     }
@@ -671,7 +774,9 @@ def refreshCallback(response, data) {
         if (settings.reportBattery) {
             handleBatteryLevel(json.batteryLevel)
         }
-        if (settings.reportMotion) {
+        // Each field is used only when the tablet reports it: some Fully Kiosk versions leave out e.g.
+        // motionDetected and audioVolume (1.60 does), and a missing field must not read as 'inactive' or null.
+        if (settings.reportMotion && json.motionDetected != null) {
             def motionValue = json.motionDetected ? 'active' : 'inactive'
             if (motionValue != device.currentValue('motion')) {
                 logger('I', {"Motion: ${motionValue}"})
@@ -679,27 +784,27 @@ def refreshCallback(response, data) {
             }
         }
 
-        if (settings.reportCameraMotion) {
+        if (settings.reportCameraMotion && json.motionDetected != null) {
             def cameraMotionValue = json.motionDetected ? 'active' : 'inactive'
             if (cameraMotionValue != device.currentValue('cameraMotion')) {
                 logger('I', {"Camera Motion: ${cameraMotionValue}"})
                 sendEvent([name:'cameraMotion', value:cameraMotionValue])
             }
         }
-        if (settings.reportAcceleration) {
+        if (settings.reportAcceleration && json.movementDetected != null) {
             def accelerationValue = json.movementDetected ? 'active' : 'inactive'
             if (accelerationValue != device.currentValue('acceleration')) {
                 logger('I', {"Acceleration: ${accelerationValue}"})
                 sendEvent([name:'acceleration', value:accelerationValue])
             }
         }
-        if (settings.reportVolume) {
+        if (settings.reportVolume && json.audioVolume != null) {
             if (json.audioVolume != device.currentValue('volume')) {
                 logger('I', {"Volume: ${json.audioVolume}"})
                 sendEvent([name:'volume', value:json.audioVolume])
             }
         }
-        if (settings.reportSwitch) {
+        if (settings.reportSwitch && json.screenOn != null) {
             def switchValue = (json.screenOn == true) ? 'on' : 'off'
             if (switchValue != device.currentValue('switch')) {
                 logger('I', {"Switch: ${switchValue}"})
@@ -707,9 +812,10 @@ def refreshCallback(response, data) {
             }
         }
         if (settings.reportBrightness && json.screenBrightness != null) {
-            if (json.screenBrightness != device.currentValue('level')) {
-                logger('I', {"Brightness Level: ${json.screenBrightness}"})
-                sendEvent([name:'level', value:json.screenBrightness])
+            Integer level = brightnessToLevel(json.screenBrightness)
+            if (level != device.currentValue('level')) {
+                logger('I', {"Brightness Level: ${level}% (tablet: ${json.screenBrightness}/255)"})
+                sendEvent([name:'level', value:level, unit:'%'])
             }
         }
         if (settings.reportPageUrl && json.currentPage != null) {
@@ -725,8 +831,8 @@ def refreshCallback(response, data) {
 }
 
 def handleBatteryLevel(batteryLevel) {
-    if (batteryLevel == null) return
-    def batteryValue = batteryLevel.toInteger()
+    Integer batteryValue = toIntOrNull(batteryLevel)
+    if (batteryValue == null) return
     if (batteryValue != device.currentValue('battery')) {
         logger('I', {"Battery Level: ${batteryValue}%"})
         sendEvent([name:'battery', value:batteryValue])
@@ -758,14 +864,15 @@ def sirenStart(eventValue) {
     logger('T', {"sirenVolume:${sirenVolume}"})
     logger('T', {"eventValue:${eventValue}"})
     if (sirenVolume && sirenFile && eventValue) {
-        state.siren = state.mute ?: (device.currentValue('volume') ?: 100)
+        state.siren = volumeToRestore(state.mute, device.currentValue('volume'))
         logger('T', {"Previous volume saved to state.siren:${state.siren}"})
-        unmute()
-        setVolume(sirenVolume)
+        // One volume command, then the sound once the tablet has answered it. unmute() + setVolume() used to send
+        // two volume commands at once, and when they arrived swapped the siren played at the restored volume.
+        sendVolume(sirenVolume, playSoundCmd(sirenFile, true))
         sendEvent([name:'alarm', value:eventValue])
-        sendCommandPost("cmd=playSound&loop=true&url=${java.net.URLEncoder.encode(sirenFile, 'UTF-8')}")
-        if (settings.clearAlarmInterval > 0) {
-            runIn(settings.clearAlarmInterval.toInteger(), 'sirenStop')
+        int clearAfter = safeToInt(settings.clearAlarmInterval, 0)
+        if (clearAfter > 0) {
+            runIn(clearAfter, 'sirenStop')
         }
     } else {
         logger('D', 'sirenFile,sirenVolume or eventValue not set')
@@ -774,8 +881,8 @@ def sirenStart(eventValue) {
 
 def sirenStop() {
     logger('I', '[sirenStop]')
-    if (state.siren) {
-        setVolume(state.siren)
+    if (state.siren != null) {
+        sendVolume(state.siren)
         state.remove('siren')
     }
     sendEvent([name:'alarm', value:'off'])
@@ -784,7 +891,11 @@ def sirenStop() {
 
 def playSound(soundFile) {
     logger('D', {"[playSound] soundFile:${soundFile}"})
-    sendCommandPost("cmd=playSound&url=${java.net.URLEncoder.encode(soundFile, 'UTF-8')}")
+    if (!soundFile) {
+        logger('W', 'playSound: no sound file URL given')
+        return
+    }
+    sendCommandPost(playSoundCmd(soundFile))
 }
 
 def stopSound() {
@@ -799,7 +910,11 @@ def setBooleanSetting(key, value) {
 
 def setStringSetting(key, value) {
     logger('D', {"[setStringSetting] key,value: ${key},${value}"})
-    sendCommandPost("cmd=setStringSetting&key=${key}&value=${java.net.URLEncoder.encode(value, 'UTF-8')}")
+    sendStringSetting(key, value)
+}
+
+private void sendStringSetting(key, value, String nextCmd = null) {
+    sendCommandPost("cmd=setStringSetting&key=${key}&value=${urlEncode(value)}", nextCmd)
 }
 
 // *** [ Communication Methods ] **********************************************
@@ -814,11 +929,15 @@ def updateDeviceDataCallback(response, data) {
     def resp = (response instanceof String && data != null) ? data : response
     logger('T', {"response status,data: ${resp?.status ?: resp?.getStatus()},${response instanceof String ? response : data}"})
     if (isResponseOk(response, data)) {
-        logger({"response.json: ${resp.json}"}, 'debug')
-        device.updateDataValue('appVersionName', resp.json.appVersionName)
-        device.updateDataValue('deviceManufacturer', resp.json.deviceManufacturer)
-        device.updateDataValue('androidVersion', resp.json.androidVersion)
-        device.updateDataValue('deviceModel', resp.json.deviceModel)
+        def json = safeGetResponseJson(resp)
+        if (json == null) {
+            logger('W', 'Device info response had no valid JSON')
+            return
+        }
+        logger('D', {"response.json: ${json}"})
+        ['appVersionName', 'deviceManufacturer', 'androidVersion', 'deviceModel'].each { key ->
+            if (json[key] != null) device.updateDataValue(key, "${json[key]}")
+        }
     } else {
         def statustext = (resp?.json instanceof Map) ? resp.json.statustext : null
         if (statustext?.toString()?.toLowerCase()?.contains('please login')) {
@@ -837,12 +956,16 @@ def checkServerDefined() {
     return infoSet
 }
 
-def sendCommandPost(cmdDetails='') {
+/**
+ * Commands are asynchronous, and the tablet may handle two of them in either order. When one must follow another
+ * (play a sound after setting its volume, reload the page after storing the script), pass it as nextCmd: it is
+ * sent from this command's callback, whatever the answer — so e.g. the siren still sounds if the volume failed.
+ */
+def sendCommandPost(cmdDetails='', String nextCmd=null) {
     logger('D', '[sendCommandPost]')
     if (!checkServerDefined()) return
     logger('T', {"cmdDetails:${cmdDetails}"})
-    def postParams = getRequestParams(cmdDetails)
-    asynchttpPost('sendCommandCallback', postParams, null)
+    asynchttpPost('sendCommandCallback', getRequestParams(cmdDetails), nextCmd ? [nextCmd: nextCmd] : null)
 }
 
 def sendCommandCallback(response, data) {
@@ -854,15 +977,18 @@ def sendCommandCallback(response, data) {
     } else {
         logger('E', {"Invalid response: ${resp?.status ?: resp?.getStatus()}"})
     }
+    if (data instanceof Map && data.nextCmd) {
+        sendCommandPost(data.nextCmd)
+    }
 }
 
 def getRequestParams(cmdDetails='') {
     def params = [
-        uri: "http://${serverIP}:${serverPort}/?type=json&password=${serverPassword}&${cmdDetails}",
+        uri: fkbUrl(serverIP, serverPort, serverPassword, cmdDetails, true),
         requestContentType: 'application/json',
         contentType: 'application/json'
     ]
-    logger('T', {"Request params: ${params}"})
+    logger('T', {"Request uri: ${maskPassword(params.uri)}"})
     return params
 }
 
@@ -889,6 +1015,102 @@ def isResponseOk(response, data = null) {
     if (payload != null && payload.status == 'Error') return false
     if (payload != null && payload.status != null && payload.status != 'OK') return false
     return true
+}
+
+// *** [ Pure Helpers ] — no hub state; covered by FullyKioskBrowserSpec ********
+
+/** URL of a Fully Kiosk REST command. The password is URL-encoded: raw, a '&', '#', '+' or space broke every command. */
+String fkbUrl(ip, port, password, String cmdDetails, boolean json = true) {
+    return "http://${ip}:${port}/?${json ? 'type=json&' : ''}password=${urlEncode(password)}&${cmdDetails}"
+}
+
+String urlEncode(value) {
+    return java.net.URLEncoder.encode(value == null ? '' : "${value}", 'UTF-8')
+}
+
+String maskPassword(String url) {
+    return url?.replaceAll(/password=[^&]*/, 'password=***')
+}
+
+String playSoundCmd(url, boolean loop = false) {
+    return "cmd=playSound${loop ? '&loop=true' : ''}&url=${urlEncode(url)}"
+}
+
+/** An IPv4 address as the 8-hex-digit DNI the hub routes reports by, or null when ip isn't an IPv4 address. */
+String ipToHex(ip) {
+    String[] parts = "${ip ?: ''}".trim().split('\\.', -1)
+    if (parts.length != 4 || !parts.every { it ==~ /\d{1,3}/ && it.toInteger() <= 255 }) return null
+    return parts.collect { String.format('%02X', it.toInteger()) }.join()
+}
+
+/**
+ * Quartz cron that polls every `minutes`, on second :00 — or null when no cron keeps that pace, and the caller
+ * chains runIn instead. 1.7.x always built "0 0/<minutes> * * * ?": Quartz rejects an increment of 60 or more,
+ * and one that doesn't divide 60 restarts each hour (45 polled at :00 and :45).
+ */
+String pollCron(minutes) {
+    int m = safeToInt(minutes, 0)
+    if (m <= 0) return null
+    if (m < 60) return (60 % m == 0) ? "0 0/${m} * * * ?" : null
+    if (m % 60 != 0) return null
+    int hours = m.intdiv(60)
+    if (hours == 24) return '0 0 0 * * ?'
+    return (hours < 24 && 24 % hours == 0) ? "0 0 0/${hours} * * ?" : null
+}
+
+/** Volume to step from: the one mute() saved while muted, else the current one. null when neither is known. */
+Integer volumeTarget(saved, current, int delta) {
+    Integer base = firstVolume(saved, current)
+    return base == null ? null : clampInt(base + delta, 0, 100)
+}
+
+/** Volume to put back after the siren or unmute: saved, else current, else 100. A 0 stays 0 (1.7.x made it 100). */
+Integer volumeToRestore(saved, current) {
+    Integer base = firstVolume(saved, current)
+    return base == null ? 100 : clampInt(base, 0, 100)
+}
+
+private Integer firstVolume(saved, current) {
+    Integer v = toIntOrNull(saved)
+    return v != null ? v : toIntOrNull(current)
+}
+
+/** speak()'s optional volume: null when not given (-1 is the capability's default, or null/blank), else 0-100. */
+Integer parseSpeakVolume(volume) {
+    Integer v = toIntOrNull(volume)
+    return (v == null || v < 0) ? null : clampInt(v, 0, 100)
+}
+
+/** SwitchLevel's 0-100% as the tablet's 0-255 screen brightness. */
+Integer levelToBrightness(level) {
+    Integer lvl = toIntOrNull(level)
+    return lvl == null ? null : rescale(clampInt(lvl, 0, 100), 255, 100)
+}
+
+/** The tablet's 0-255 screen brightness as 0-100%. */
+Integer brightnessToLevel(brightness) {
+    Integer b = toIntOrNull(brightness)
+    return b == null ? null : rescale(clampInt(b, 0, 255), 100, 255)
+}
+
+private int rescale(int value, int to, int from) {
+    return new BigDecimal(value * to).divide(new BigDecimal(from), 0, RoundingMode.HALF_UP).intValue()
+}
+
+int clampInt(int value, int min, int max) {
+    return Math.max(min, Math.min(max, value))
+}
+
+/** Lenient number parsing for settings, attributes and command arguments: '55.0' -> 55, 42.6 -> 43, junk -> null. */
+Integer toIntOrNull(value) {
+    if (value == null) return null
+    String s = "${value}".trim()
+    if (!s) return null
+    try {
+        return new BigDecimal(s).setScale(0, RoundingMode.HALF_UP).intValueExact()
+    } catch (Exception ignored) {
+        return null
+    }
 }
 
 // *** [ Log Methods ] ****************************************************
