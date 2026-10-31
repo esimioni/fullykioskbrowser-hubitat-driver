@@ -6,7 +6,7 @@
 // Original Support: https://community.hubitat.com/t/release-fully-kiosk-browser-controller/12223
 /*
 [Change Log]
-    1.8.0 (unreleased): Battery level reports are throttled to at most one every 30 s, so devices that fire
+    1.8.0: Battery level reports are throttled to at most one every 30 s, so devices that fire
             onBatteryLevelChanged dozens of times per second no longer flood the hub. The 15-minute fallback
             report is unchanged.
         : Server passwords with special characters (& # + % or a space) now work: the password is URL-encoded.
