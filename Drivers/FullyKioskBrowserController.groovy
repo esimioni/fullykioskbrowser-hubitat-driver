@@ -9,6 +9,9 @@
     1.9.0: Reports whether the tablet is plugged in, as the standard PowerSource capability: powerSource is 'mains'
             when plugged and 'battery' when not. Read on each poll from the tablet's device info, so a change shows
             up on the next poll. Can be turned off in the preferences (Report Power Source).
+            Note: if a smart plug controls the tablet's charging, powerSource alternates between 'mains' and 'battery'
+            as the plug switches. Apps and rules that treat mains -> battery as a power outage (e.g. Power Outage
+            Manager) should not use such a tablet as an outage sensor.
         : The battery level in the logs says (plugged) or (unplugged), as Fully shows it: "Battery Level: 81% (unplugged)".
     1.8.0: Battery level reports are throttled to at most one every 30 s, so devices that fire
             onBatteryLevelChanged dozens of times per second no longer flood the hub. The 15-minute fallback
@@ -202,7 +205,7 @@ metadata {
         input(name:'reportVolume', type: 'bool', title: 'Report Volume', defaultValue: false)
         input(name:'reportSwitch', type: 'bool', title: 'Report Screen On/Off', defaultValue: true)
         input(name:'reportBattery', type: 'bool', title: 'Report Battery Level', defaultValue: true)
-        input(name:'reportPowerSource', type: 'bool', title: 'Report Power Source (plugged in or not)', defaultValue: true)
+        input(name:'reportPowerSource', type: 'bool', title: 'Report Power Source (plugged in or not)', description: 'mains when plugged in, battery when not. If a smart plug controls the charging, it alternates as the plug switches: don\'t use this tablet as a power outage sensor.', defaultValue: true)
         input(name:'reportBrightness', type: 'bool', title: 'Report Screen Brightness', defaultValue: false)
         input(name:'reportPageUrl', type: 'bool', title: 'Report Current Page URL', defaultValue: false)
         input(name:'loggingLevel', type:'enum', title:'Logging level', options: ['1':'Error', '2':'Warning', '3':'Info', '4':'Debug', '5':'Trace'], defaultValue: '3', required: true)
