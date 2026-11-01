@@ -295,4 +295,26 @@ class FullyKioskBrowserSpec extends Specification {
         'abc'  || null
         null   || null
     }
+
+    // --- Power source (1.9.0) ----------------------------------------------------------------------
+
+    @Unroll
+    def "powerSourceOf(#json) == #expected"() {
+        // Asked in the forum (Greenwave, 2026-11-01): plugged/unplugged. The poll's deviceInfo already
+        // carries it — read on a Fire HD with Fully 1.60: isPlugged=false, plugged=false, batteryLevel=55.
+        expect:
+        driver.powerSourceOf(json) == expected
+
+        where:
+        json                              || expected
+        [isPlugged: true]                 || 'mains'
+        [isPlugged: false]                || 'battery'
+        [isPlugged: false, plugged: true] || 'battery'  // isPlugged is the one Fully documents; it wins
+        [plugged: true]                   || 'mains'    // a version that only sends 'plugged'
+        [plugged: false]                  || 'battery'
+        [batteryLevel: 55]                || null       // not reported: no event, never a guess
+        [isPlugged: null]                 || null
+        [isPlugged: 'yes']                || null       // not a boolean: unknown, no event
+        null                              || null
+    }
 }

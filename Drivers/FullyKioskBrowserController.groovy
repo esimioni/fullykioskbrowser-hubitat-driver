@@ -1,4 +1,4 @@
-// Fully Kiosk Browser Driver 1.8.0
+// Fully Kiosk Browser Driver 1.9.0
 // Github: https://github.com/esimioni/fullykioskbrowser-hubitat-driver
 
 // Fork of Original Driver by Gavin Campbell 1.4.1:
@@ -6,6 +6,9 @@
 // Original Support: https://community.hubitat.com/t/release-fully-kiosk-browser-controller/12223
 /*
 [Change Log]
+    1.9.0: Reports whether the tablet is plugged in, as the standard PowerSource capability: powerSource is 'mains'
+            when plugged and 'battery' when not. Read on each poll from the tablet's device info, so a change shows
+            up on the next poll. Can be turned off in the preferences (Report Power Source).
     1.8.0: Battery level reports are throttled to at most one every 30 s, so devices that fire
             onBatteryLevelChanged dozens of times per second no longer flood the hub. The 15-minute fallback
             report is unchanged.
@@ -135,6 +138,7 @@ metadata {
         capability 'Configuration'
         capability 'AccelerationSensor'
         capability 'Notification'
+        capability 'PowerSource'
         capability 'ImageCapture'
 
         attribute 'currentPageUrl', 'String'
@@ -197,6 +201,7 @@ metadata {
         input(name:'reportVolume', type: 'bool', title: 'Report Volume', defaultValue: false)
         input(name:'reportSwitch', type: 'bool', title: 'Report Screen On/Off', defaultValue: true)
         input(name:'reportBattery', type: 'bool', title: 'Report Battery Level', defaultValue: true)
+        input(name:'reportPowerSource', type: 'bool', title: 'Report Power Source (plugged in or not)', defaultValue: true)
         input(name:'reportBrightness', type: 'bool', title: 'Report Screen Brightness', defaultValue: false)
         input(name:'reportPageUrl', type: 'bool', title: 'Report Current Page URL', defaultValue: false)
         input(name:'loggingLevel', type:'enum', title:'Logging level', options: ['1':'Error', '2':'Warning', '3':'Info', '4':'Debug', '5':'Trace'], defaultValue: '3', required: true)
@@ -774,6 +779,15 @@ def refreshCallback(response, data) {
         if (settings.reportBattery) {
             handleBatteryLevel(json.batteryLevel)
         }
+        // A preference added after the device was saved reads null until Save Preferences, so only an explicit
+        // false turns this off — devices updated from 1.8.x report the power source without any extra step.
+        if (settings.reportPowerSource != false) {
+            String source = powerSourceOf(json)
+            if (source != null && source != device.currentValue('powerSource')) {
+                logger('I', {"Power Source: ${source}"})
+                sendEvent([name:'powerSource', value:source])
+            }
+        }
         // Each field is used only when the tablet reports it: some Fully Kiosk versions leave out e.g.
         // motionDetected and audioVolume (1.60 does), and a missing field must not read as 'inactive' or null.
         if (settings.reportMotion && json.motionDetected != null) {
@@ -837,6 +851,17 @@ def handleBatteryLevel(batteryLevel) {
         logger('I', {"Battery Level: ${batteryValue}%"})
         sendEvent([name:'battery', value:batteryValue])
     }
+}
+
+/**
+ * PowerSource value from the tablet's deviceInfo: 'mains' when plugged in, 'battery' when not, null when the
+ * tablet doesn't say (no event — never a guess). Fully documents isPlugged; plugged is the fallback for a
+ * version that only sends that one.
+ */
+String powerSourceOf(Map json) {
+    def plugged = json?.isPlugged != null ? json.isPlugged : json?.plugged
+    if (!(plugged instanceof Boolean)) return null
+    return plugged ? 'mains' : 'battery'
 }
 
 def both() {
