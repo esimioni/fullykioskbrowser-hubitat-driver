@@ -9,6 +9,7 @@
     1.9.0: Reports whether the tablet is plugged in, as the standard PowerSource capability: powerSource is 'mains'
             when plugged and 'battery' when not. Read on each poll from the tablet's device info, so a change shows
             up on the next poll. Can be turned off in the preferences (Report Power Source).
+        : The battery level in the logs says (plugged) or (unplugged), as Fully shows it: "Battery Level: 81% (unplugged)".
     1.8.0: Battery level reports are throttled to at most one every 30 s, so devices that fire
             onBatteryLevelChanged dozens of times per second no longer flood the hub. The 15-minute fallback
             report is unchanged.
@@ -776,17 +777,18 @@ def refreshCallback(response, data) {
         }
         logger('T', {"response.json: ${json}"})
 
-        if (settings.reportBattery) {
-            handleBatteryLevel(json.batteryLevel)
-        }
+        // Power source first: the battery line of this same poll says (plugged)/(unplugged) from it. It goes in
+        // as an argument because device.currentValue() is cached per execution and would still return the old
+        // value right after the sendEvent below.
+        String source = powerSourceOf(json)
         // A preference added after the device was saved reads null until Save Preferences, so only an explicit
         // false turns this off — devices updated from 1.8.x report the power source without any extra step.
-        if (settings.reportPowerSource != false) {
-            String source = powerSourceOf(json)
-            if (source != null && source != device.currentValue('powerSource')) {
-                logger('I', {"Power Source: ${source}"})
-                sendEvent([name:'powerSource', value:source])
-            }
+        if (settings.reportPowerSource != false && source != null && source != device.currentValue('powerSource')) {
+            logger('I', {"Power Source: ${source}${plugSuffix(source)}"})
+            sendEvent([name:'powerSource', value:source])
+        }
+        if (settings.reportBattery) {
+            handleBatteryLevel(json.batteryLevel, settings.reportPowerSource != false ? source : null)
         }
         // Each field is used only when the tablet reports it: some Fully Kiosk versions leave out e.g.
         // motionDetected and audioVolume (1.60 does), and a missing field must not read as 'inactive' or null.
@@ -844,13 +846,20 @@ def refreshCallback(response, data) {
     }
 }
 
-def handleBatteryLevel(batteryLevel) {
+def handleBatteryLevel(batteryLevel, String source = null) {
     Integer batteryValue = toIntOrNull(batteryLevel)
     if (batteryValue == null) return
     if (batteryValue != device.currentValue('battery')) {
-        logger('I', {"Battery Level: ${batteryValue}%"})
+        // Pushed by the tablet (no source passed): the last power source a poll saw, unless the report is off.
+        String plug = source ?: (settings.reportPowerSource != false ? device.currentValue('powerSource') : null)
+        logger('I', {"Battery Level: ${batteryValue}%${plugSuffix(plug)}"})
         sendEvent([name:'battery', value:batteryValue])
     }
+}
+
+/** ' (plugged)' / ' (unplugged)' after the battery level in the logs, as Fully shows it ('81.0% (unplugged)'). */
+String plugSuffix(String source) {
+    source == 'mains' ? ' (plugged)' : source == 'battery' ? ' (unplugged)' : ''
 }
 
 /**

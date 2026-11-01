@@ -317,4 +317,17 @@ class FullyKioskBrowserSpec extends Specification {
         [isPlugged: 'yes']                || null       // not a boolean: unknown, no event
         null                              || null
     }
+
+    @Unroll
+    def "plugSuffix(#source) == '#expected': the battery log reads like Fully's own '81.0% (unplugged)'"() {
+        expect:
+        driver.plugSuffix(source) == expected
+
+        where:
+        source    || expected
+        'mains'   || ' (plugged)'
+        'battery' || ' (unplugged)'
+        'unknown' || ''
+        null      || ''
+    }
 }
